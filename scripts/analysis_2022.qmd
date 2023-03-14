@@ -1,0 +1,144 @@
+---
+title: "Preparing Apple Music data"
+format: html
+editor: visual
+---
+
+```{r setup}
+#| echo: false
+#| message: false
+#| warning: false
+
+# Thu Nov  3 20:49:43 2022
+
+library(tidyverse)
+library(lubridate)
+```
+
+```{r read}
+#| message: false
+#| warning: false
+
+activity_all <- read_csv(str_c(getwd(),"/DATA/2022-10-20/Apple Music Activity/Apple Music Play Activity.csv")) |> 
+  as_tibble() |> 
+  janitor::clean_names()
+
+columns <- colnames(activity_all)
+
+EXPORT_DATE <- activity_all |> select(event_end_timestamp) |> arrange(desc(event_end_timestamp)) |> head(1) |> pull() |> as_date()
+```
+
+```{r clean}
+rm_names <- c("","!!!")
+
+activity_cleaned <-
+  activity_all %>% 
+  mutate(
+    media_type = as.character(media_type),
+    artist_name = as.character(artist_name),
+    song_length = media_duration_in_milliseconds/60000,
+    event_end_timestamp = as_datetime(event_end_timestamp),
+    event_start_timestamp = as_datetime(event_start_timestamp),
+    year = event_start_timestamp %>% year(),
+    play_mins = difftime(event_end_timestamp, event_start_timestamp, units = "mins") %>% as.numeric() %>% round(2)
+  ) %>% 
+  filter(
+    media_type == "AUDIO",
+    !(artist_name %in% rm_names),
+    !is.na(artist_name),
+    
+    # note that the following are modestly more consequential choices than preceding
+    
+    # this seems like it really gunks things up
+    item_type != "TIMED_METADATA_PING", 
+    !(play_mins > 10 & end_reason_type != "NATURAL_END_OF_TRACK"), # seems like this skims off some obviously wrong stuff
+    play_mins > .01, # eliminate trivially small events
+    event_type != "LYRIC_DISPLAY" # ?
+  ) %>% 
+  
+  # drop unnecessary cols
+  select(
+    # -content_provider, 
+    -build_version, -client_ip_address, -apple_music_subscription,
+    -apple_id_number, -device_identifier, -metrics_bucket_id, -metrics_client_id#,
+    # -store_country_name, -original_title, -content_specific_type
+  ) %>% 
+  
+  # drop excessive repeats for signal/noise reasons
+  arrange(event_start_timestamp) %>% 
+  group_by(artist_name, song_name, play_mins, date(event_start_timestamp)) %>% 
+  mutate(
+    play = 1,
+    play_ticker = cumsum(play)
+  ) %>% 
+  ungroup() %>% 
+  filter(
+    play_ticker <= 15
+  ) %>% 
+  select(-play)
+```
+
+```{r make dfs}
+activity_2022 <- activity_cleaned %>% 
+  filter(between(event_start_timestamp,as_datetime("2022/01/01"),as_datetime("2022/12/31")))
+activity_last_12_months <- activity_cleaned %>% 
+  filter(between(event_start_timestamp, as_datetime(as_date(EXPORT_DATE)-365), as_datetime(as_date(EXPORT_DATE))))
+```
+
+```{r 2022 analysis}
+#| message: false
+#| warning: false
+
+# total playtime
+(minutes_2022 <- activity_2022 %>% pull(play_mins) %>% sum() %>% round(0))
+
+# top artists by play time
+activity_2022 %>% 
+  group_by(artist_name) %>% 
+  summarise(minutes = sum(play_mins, rm.na = T) |> round(0), 
+            hours = (minutes/60) |> round(1)) %>% 
+  arrange(desc(minutes)) |> 
+  head(5) |> 
+  knitr::kable()
+
+# top songs by minutes played
+activity_2022 %>%
+  group_by(artist_name, song_name) %>%
+  summarise(
+    minutes = sum(play_mins, rm.na = T),
+    plays = length(play_mins)
+  ) %>%
+  ungroup() |> 
+  arrange(desc(minutes)) |> 
+  head(6) |> 
+  # slice_tail(n=5) |> 
+  knitr::kable()
+
+
+# top songs by estimated times played
+activity_2022 %>% 
+  group_by(artist_name, song_name) %>% 
+  summarise(
+    minutes = sum(play_mins, rm.na = T), 
+    plays = length(play_mins),
+    est_complete_plays = (minutes/median(song_length)) %>% round(0)
+  ) %>% 
+  ungroup() |> 
+  arrange(desc(est_complete_plays)) |> 
+  head(5) |> 
+  knitr::kable()
+```
+
+```{r all time}
+activity_cleaned %>% 
+  group_by(artist_name) %>% 
+  summarise(minutes = sum(play_mins, rm.na = T) |> round(0), 
+            hours = (minutes/60) |> round(1)) %>% 
+  arrange(desc(minutes)) |> 
+  head(25) |> 
+  knitr::kable()
+```
+
+```{r}
+activity_cleaned |> group_by(year = lubridate::year(event_start_timestamp)) |> summarize(minutes = sum(play_mins)) |> ungroup() |> mutate(minutes = ifelse(year == 2022, minutes*1.2, minutes)) |> ggplot() + geom_bar(aes(x = year, y = minutes), stat = 'identity') + theme_minimal() + coord_flip() +ggtitle("listening time by year", "minutes for 2022 imputed to account for period ending in october") + scale_x_continuous(breaks = 2016:2022) +scale_y_continuous(labels = str_c(seq(0,60000,by=20000)/1000,"k")) + theme(axis.title.y = element_blank())
+```
